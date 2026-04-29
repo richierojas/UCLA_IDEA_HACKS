@@ -6,189 +6,86 @@ import math
 from analog_io import AnalogInput
 import adafruit_mpu6050
 
-# =========================================================
-# SENSORS
-# =========================================================
+# EMG processing
+class EMGProcessor:
+    def __init__(self):
+        self.filtered = 0
+        self.alpha = 0.2
 
-emg = AnalogInput(pykit_explorer.board.A4)
-pulse = AnalogInput(pykit_explorer.board.A5)
+    def process(self, envelope_value):
+        self.filtered = (1 - self.alpha) * self.filtered + self.alpha * envelope_value
 
-i2c = pykit_explorer.board.I2C()
-mpu = adafruit_mpu6050.MPU6050(i2c)
+        activation = self.filtered / 50000
+        activation = max(0, min(1, activation))
 
-print("✓ Sensors initialized")
+        return activation
+# Pulse processing
+class PulseSensor:
+    def __init__(self, pin):
+        self.sensor = AnalogInput(pin)
 
-# =========================================================
-# HELPERS
-# =========================================================
+        self.threshold = 30000
+        self.last_beat_time = 0
+        self.bpm = 0
 
-def read_avg(sensor, samples=5):
-    total = 0
-    for _ in range(samples):
-        total += sensor.raw
-        pykit_explorer.time.sleep(0.001)
-    return total / samples
+        self.alpha = 0.1
+        self.baseline = 0
 
-def clamp(x, a, b):
-    return max(a, min(b, x))
+    def read(self):
+        return self.sensor.value
 
-def map_range(x, in_min, in_max, out_min, out_max):
-    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    def get_bpm(self, value):
+        now = pykit_explorer.time.monotonic()
 
-# =========================================================
-# EMG CALIBRATION
-# =========================================================
+        self.baseline = (1 - self.alpha) * self.baseline + self.alpha * value
+        signal = value - self.baseline
 
-print("Calibrating EMG... stay relaxed")
+        if signal > self.threshold and (now - self.last_beat_time) > 0.5:
 
-rest_vals = [read_avg(emg, 10) for _ in range(30)]
-rest = sum(rest_vals) / len(rest_vals)
+            if self.last_beat_time != 0:
+                interval = now - self.last_beat_time
 
-print("Baseline locked:", int(rest))
+                if 0.3 < interval < 2.0:
+                    instant = 60 / interval
+                    self.bpm = 0.8 * self.bpm + 0.2 * instant
 
-REST_DELTA = 1500
-MAX_DELTA = 5000
+            self.last_beat_time = now
 
-peak = 0
-DECAY = 0.96
+        return self.bpm
 
-# =========================================================
-# PULSE SETTINGS (FIXED)
-# =========================================================
+# IMU processing
+class IMUSensor:
+    def __init__(self):
+        self.i2c = pykit_explorer.board.I2C()
+        self.mpu = adafruit_mpu6050.MPU6050(self.i2c)
 
-beat_times = []
-last_beat = 0
+    def fall_detected(self):
+        ax, ay, az = self.mpu.acceleration
 
-bpm = 75.0
-prev_bpm = 75.0
+        total_accel = math.sqrt(ax**2 + ay**2 + az**2)
 
-BUFFER_SIZE = 8
-buffer = []
+        free_fall = total_accel < 5
+        impact = total_accel > 13
 
-THRESHOLD = 25
-REFRACTORY = 0.45
+        return free_fall or impact
 
-pulse_base = 0
-alpha = 0.1
+#sensor loop
+pulse = PulseSensor(pykit_explorer.board.A0)
+emg_sensor = AnalogInput(pykit_explorer.board.A1)
+emg_processor = EMGProcessor()
+imu = IMUSensor()
 
-# =========================================================
-# FALL SETTINGS
-# =========================================================
+print("Starting sensor loop")
 
-HIGH_G = 13.0
-LOW_G = 5.0
-
-print("✓ SYSTEM STARTED")
-
-# =========================================================
-# MAIN LOOP
-# =========================================================
-
+# Main loop
 while True:
+    emg_value = emg_sensor.value
+    activation = emg_processor.process(emg_value)
+    bpm = pulse.get_bpm(pulse.read())
+    fall = imu.fall_detected()
 
-    now = pykit_explorer.time.monotonic()
-
-    # =====================================================
-    # FALL DETECTION
-    # =====================================================
-
-    ax, ay, az = mpu.acceleration
-    accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
-
-    fall_detected = accel_mag > HIGH_G or accel_mag < LOW_G
-
-    # =====================================================
-    # EMG PROCESSING
-    # =====================================================
-
-    emg_value = emg.raw
-    emg_delta = abs(emg_value - rest)
-
-    if emg_delta > peak:
-        peak = emg_delta
-    else:
-        peak *= DECAY
-
-    emg_strength = map_range(peak, REST_DELTA, MAX_DELTA, 0, 5)
-    emg_strength = clamp(emg_strength, 0, 5)
-
-    # =====================================================
-    # PULSE PROCESSING (STABLE BPM FIX)
-    # =====================================================
-
-    raw = pulse.raw
-
-    # moving baseline filter
-    pulse_base = (1 - alpha) * pulse_base + alpha * raw
-
-    signal = raw - pulse_base
-
-    buffer.append(signal)
-    if len(buffer) > BUFFER_SIZE:
-        buffer.pop(0)
-
-    smooth = sum(buffer) / len(buffer)
-
-    # =====================================================
-    # BEAT DETECTION
-    # =====================================================
-
-    if smooth > THRESHOLD:
-
-        if now - last_beat > REFRACTORY:
-
-            interval = now - last_beat
-            last_beat = now
-
-            if 0.4 < interval < 1.2:
-
-                instant_bpm = 60 / interval
-
-                if 40 < instant_bpm < 180:
-                    bpm = 0.85 * bpm + 0.15 * instant_bpm
-
-    # slow decay only when no signal
-    if now - last_beat > 3:
-        bpm *= 0.995
-
-    # =====================================================
-    # FALL RESPONSE
-    # =====================================================
-
-    if fall_detected:
-        print("\n🚨 FALL DETECTED! SYSTEM STOPPED")
-
-        print(f"Previous BPM: {prev_bpm:.1f}")
-        print(f"Current BPM: {bpm:.1f}")
-
-        if bpm > prev_bpm:
-            trend = "INCREASING 📈"
-        elif bpm < prev_bpm:
-            trend = "DECREASING 📉"
-        else:
-            trend = "STABLE ➖"
-
-        print("Trend:", trend)
-
-        if emg_strength >= 3:
-            print("⚡ MUSCLE STATE: TENSE (possible seizure/spasm)")
-        else:
-            print("💤 MUSCLE STATE: RELAXED (possible faint)")
-
-        while True:
-            pass
-
-    # =====================================================
-    # OUTPUT
-    # =====================================================
-
-    print(
-        "EMG:", round(emg_strength, 2),
-        "BPM:", round(bpm, 1),
-        "Accel:", round(accel_mag, 2),
-        "Fall:", fall_detected
-    )
-
-    prev_bpm = bpm
+    print("BPM:", bpm)
+    print("Fall detected:", fall)
+    print("EMG activation:", activation)
 
     pykit_explorer.time.sleep(0.02)
